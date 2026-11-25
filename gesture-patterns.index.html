@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hand Garden</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; overflow: hidden; font-family: system-ui, sans-serif; color: #fff; }
+  #wrap { position: relative; width: 100vw; height: 100vh; }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  video { transform: scaleX(-1); opacity: .5; }
+  #hud { position: absolute; top: 12px; left: 12px; background: rgba(0,0,0,.55); padding: 10px 14px; border-radius: 10px; font-size: 14px; line-height: 1.6; }
+  #status { position: absolute; bottom: 12px; left: 12px; background: rgba(0,0,0,.55); padding: 6px 12px; border-radius: 8px; font-size: 13px; }
+  b { color: #ffb3d1; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="cam" autoplay playsinline muted></video>
+  <canvas id="three"></canvas>
+  <canvas id="overlay"></canvas>
+  <div id="hud">
+    🌸 <b>Pinch</b> (thumb + index) → plant flowers, drag to sow a trail<br>
+    🦋 <b>Peace sign ✌</b> → release a butterfly<br>
+    ✊ <b>Fist</b> → sweep away flowers &amp; butterflies<br>
+    Keys: <b>Z</b> undo flower · <b>C</b> clear · <b>1-5</b> flower colour · <b>0</b> random
+  </div>
+  <div id="status">Loading hand model…</div>
+</div>
+
+<script type="module">
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const video = document.getElementById("cam");
+const overlay = document.getElementById("overlay");
+const octx = overlay.getContext("2d");
+const statusEl = document.getElementById("status");
+
+// ---------- Three.js scene ----------
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById("three"), alpha: true, antialias: true });
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+camera.position.set(0, 0, 12);
+scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+const dl = new THREE.DirectionalLight(0xffffff, 0.9);
+dl.position.set(3, 6, 10);
+scene.add(dl);
+
+const HALF_H = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.position.z;
+const petalColors = [0xff6fa5, 0xffd54f, 0xffffff, 0xb388ff, 0xff9e5e];
+const wingPalettes = [
+  [0xff9800, 0x3e2723], [0x29b6f6, 0x1a237e], [0xf48fb1, 0x880e4f],
+  [0xce93d8, 0x4a148c], [0xfff176, 0xf57f17]
+];
+let colorIdx = -1; // -1 = random
+
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  overlay.width = w; overlay.height = h;
+}
+addEventListener("resize", resize); resize();
+
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+// ---------- Flowers ----------
+const petalGeo = new THREE.SphereGeometry(0.5, 12, 8);
+const stemGeo = new THREE.CylinderGeometry(0.025, 0.03, 1, 6);
+const centerGeo = new THREE.SphereGeometry(0.11, 12, 10);
+const leafGeo = new THREE.SphereGeometry(0.5, 10, 6);
+const stemMat = new THREE.MeshStandardMaterial({ color: 0x4caf50, roughness: .8 });
+const centerMat = new THREE.MeshStandardMaterial({ color: 0xffb300, roughness: .6 });
+
+function makeFlower(color) {
+  const g = new THREE.Group();
+  const petalMat = new THREE.MeshStandardMaterial({ color, roughness: .5 });
+  const n = pick([5, 6, 7, 8]);
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2;
+    const p = new THREE.Mesh(petalGeo, petalMat);
+    p.scale.set(0.2, 0.4, 0.07);
+    p.position.set(Math.cos(a) * 0.24, Math.sin(a) * 0.24, 0);
+    p.rotation.z = a - Math.PI / 2;
+    g.add(p);
+  }
+  g.add(new THREE.Mesh(centerGeo, centerMat));
+  const stem = new THREE.Mesh(stemGeo, stemMat);
+  stem.position.y = -0.5; stem.position.z = -0.02;
+  g.add(stem);
+  const leaf = new THREE.Mesh(leafGeo, stemMat);
+  leaf.scale.set(0.35, 0.14, 0.05);
+  leaf.position.set(0.18, -0.55, 0);
+  leaf.rotation.z = 0.5;
+  g.add(leaf);
+  return g;
+}
+
+const flowers = [];
+const MAX_FLOWERS = 150;
+function plantFlower(pos) {
+  const color = colorIdx < 0 ? pick(petalColors) : petalColors[colorIdx];
+  const mesh = makeFlower(color);
+  const base = rnd(0.45, 0.75);
+  mesh.position.copy(pos);
+  mesh.rotation.z = rnd(-0.25, 0.25);
+  mesh.scale.setScalar(0.001);
+  scene.add(mesh);
+  flowers.push({ mesh, base, born: performance.now(), phase: rnd(0, 6.28) });
+  if (flowers.length > MAX_FLOWERS) removeFlower(0);
+}
+function removeFlower(i) {
+  const f = flowers[i];
+  scene.remove(f.mesh);
+  f.mesh.children.forEach((c) => { if (c.material && c.material !== stemMat && c.material !== centerMat) c.material.dispose(); });
+  flowers.splice(i, 1);
+}
+
+// ---------- Butterflies ----------
+const upperShape = new THREE.Shape();
+upperShape.moveTo(0, 0);
+upperShape.bezierCurveTo(0.15, 0.55, 0.9, 0.75, 0.85, 0.2);
+upperShape.bezierCurveTo(0.8, -0.02, 0.4, -0.04, 0, 0);
+const lowerShape = new THREE.Shape();
+lowerShape.moveTo(0, 0);
+lowerShape.bezierCurveTo(0.5, -0.04, 0.85, -0.2, 0.62, -0.62);
+lowerShape.bezierCurveTo(0.4, -0.85, 0.1, -0.5, 0, 0);
+const upperGeo = new THREE.ShapeGeometry(upperShape);
+const lowerGeo = new THREE.ShapeGeometry(lowerShape);
+const spotGeo = new THREE.CircleGeometry(0.09, 12);
+const bodyGeo = new THREE.CylinderGeometry(0.035, 0.035, 0.6, 8);
+const headGeo = new THREE.SphereGeometry(0.06, 8, 8);
+
+function makeButterfly() {
+  const [c1, c2] = pick(wingPalettes);
+  const g = new THREE.Group();
+  const m1 = new THREE.MeshBasicMaterial({ color: c1, side: THREE.DoubleSide });
+  const m2 = new THREE.MeshBasicMaterial({ color: c2, side: THREE.DoubleSide });
+  const spotMat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+  const body = new THREE.Mesh(bodyGeo, new THREE.MeshBasicMaterial({ color: 0x222222 }));
+  const head = new THREE.Mesh(headGeo, body.material);
+  head.position.y = 0.32;
+  g.add(body, head);
+
+  function wing(sign) {
+    const w = new THREE.Group();
+    const up = new THREE.Mesh(upperGeo, m1);
+    const low = new THREE.Mesh(lowerGeo, m2);
+    const spot = new THREE.Mesh(spotGeo, spotMat);
+    spot.position.set(0.55, 0.28, 0.01);
+    w.add(up, low, spot);
+    w.scale.x = sign;
+    g.add(w);
+    return w;
+  }
+  const R = wing(1), L = wing(-1);
+  return { g, R, L };
+}
+
+const butterflies = [];
+const MAX_BUTTERFLIES = 25;
+function releaseButterfly(pos) {
+  const b = makeButterfly();
+  const size = rnd(0.28, 0.42);
+  b.g.scale.setScalar(size);
+  b.g.position.copy(pos);
+  scene.add(b.g);
+  const obj = {
+    ...b, pos: pos.clone(), target: pos.clone(), nextPick: 0,
+    phase: rnd(0, 6.28), flapSpeed: rnd(12, 17), vel: new THREE.Vector3()
+  };
+  butterflies.push(obj);
+  if (butterflies.length > MAX_BUTTERFLIES) removeButterfly(0);
+}
+function removeButterfly(i) {
+  scene.remove(butterflies[i].g);
+  butterflies.splice(i, 1);
+}
+
+function clearAll() {
+  while (flowers.length) removeFlower(0);
+  while (butterflies.length) removeButterfly(0);
+}
+
+addEventListener("keydown", (e) => {
+  if (e.key === "z" || e.key === "Z") { if (flowers.length) removeFlower(flowers.length - 1); }
+  if (e.key === "c" || e.key === "C") clearAll();
+  if (e.key === "0") colorIdx = -1;
+  if (e.key >= "1" && e.key <= "5") colorIdx = +e.key - 1;
+});
+
+// ---------- Hand maths ----------
+const d2 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+function toWorld(lm, handSize) {
+  const ndcX = (1 - lm.x) * 2 - 1;
+  const ndcY = -(lm.y * 2 - 1);
+  return new THREE.Vector3(
+    ndcX * HALF_H * camera.aspect,
+    ndcY * HALF_H,
+    THREE.MathUtils.clamp((handSize - 0.16) * 24, -3, 3)
+  );
+}
+const extended = (l, tip, pip) => d2(l[tip], l[0]) > d2(l[pip], l[0]) * 1.05;
+const curled = (l, tip, pip) => d2(l[tip], l[0]) < d2(l[pip], l[0]);
+
+function isFist(l) {
+  return curled(l, 8, 6) && curled(l, 12, 10) && curled(l, 16, 14) && curled(l, 20, 18);
+}
+function isPeace(l) {
+  return extended(l, 8, 6) && extended(l, 12, 10) && curled(l, 16, 14) && curled(l, 20, 18)
+    && d2(l[8], l[12]) > d2(l[5], l[9]) * 0.7; // fingers spread a bit
+}
+
+const CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function drawHand(l) {
+  const w = overlay.width, h = overlay.height;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const s = Math.max(w / vw, h / vh);
+  const ox = (w - vw * s) / 2, oy = (h - vh * s) / 2;
+  const P = (p) => [w - (p.x * vw * s + ox), p.y * vh * s + oy];
+  octx.strokeStyle = "rgba(255,255,255,.7)"; octx.lineWidth = 2;
+  CONN.forEach(([a, b]) => { const [x1, y1] = P(l[a]), [x2, y2] = P(l[b]); octx.beginPath(); octx.moveTo(x1, y1); octx.lineTo(x2, y2); octx.stroke(); });
+  octx.fillStyle = "#ff80ab";
+  l.forEach((p) => { const [x, y] = P(p); octx.beginPath(); octx.arc(x, y, 4, 0, 7); octx.fill(); });
+}
+
+// cursor
+const cursor = new THREE.Mesh(
+  new THREE.RingGeometry(0.18, 0.24, 24),
+  new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide, transparent: true, opacity: .9 })
+);
+cursor.visible = false;
+scene.add(cursor);
+
+// ---------- Tracking ----------
+let landmarker, lastVidTime = -1;
+let lastPlant = null, lastButterflyAt = 0;
+
+function onResults(res) {
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  cursor.visible = false;
+  if (!res.landmarks || !res.landmarks.length) { statusEl.textContent = "No hand detected"; lastPlant = null; return; }
+
+  const l = res.landmarks[0];
+  drawHand(l);
+  const handSize = d2(l[0], l[9]);
+  const now = performance.now();
+  const info = () => ` · 🌸 ${flowers.length}  🦋 ${butterflies.length}`;
+
+  if (isFist(l)) {
+    const c = toWorld(l[9], handSize);
+    cursor.position.copy(c); cursor.material.color.set(0xff5252); cursor.visible = true;
+    for (let i = flowers.length - 1; i >= 0; i--) if (flowers[i].mesh.position.distanceTo(c) < 1.3) removeFlower(i);
+    for (let i = butterflies.length - 1; i >= 0; i--) if (butterflies[i].pos.distanceTo(c) < 1.6) removeButterfly(i);
+    statusEl.textContent = "Sweeping" + info();
+    lastPlant = null;
+    return;
+  }
+
+  if (isPeace(l)) {
+    const c = toWorld({ x: (l[8].x + l[12].x) / 2, y: (l[8].y + l[12].y) / 2 }, handSize);
+    cursor.position.copy(c); cursor.material.color.set(0xffd54f); cursor.visible = true;
+    if (now - lastButterflyAt > 600) { releaseButterfly(c); lastButterflyAt = now; }
+    statusEl.textContent = "Releasing butterflies" + info();
+    lastPlant = null;
+    return;
+  }
+
+  const mid = { x: (l[4].x + l[8].x) / 2, y: (l[4].y + l[8].y) / 2 };
+  const c = toWorld(mid, handSize);
+  const pinching = d2(l[4], l[8]) / handSize < 0.35;
+  cursor.position.copy(c);
+  cursor.material.color.set(pinching ? 0xff6fa5 : 0xffffff);
+  cursor.visible = true;
+
+  if (pinching) {
+    if (!lastPlant || lastPlant.distanceTo(c) > 0.55) { plantFlower(c); lastPlant = c.clone(); }
+    statusEl.textContent = "Planting" + info();
+  } else {
+    lastPlant = null;
+    statusEl.textContent = "Hand tracked" + info();
+  }
+}
+
+// ---------- Animation ----------
+const clock = new THREE.Clock();
+function animate() {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+  const nowMs = performance.now();
+
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVidTime) {
+    lastVidTime = video.currentTime;
+    onResults(landmarker.detectForVideo(video, nowMs));
+  }
+
+  // flowers: grow in, then sway
+  for (const f of flowers) {
+    const k = Math.min((nowMs - f.born) / 600, 1);
+    const ease = 1 - Math.pow(1 - k, 3);
+    const over = k < 1 ? 1 + Math.sin(k * Math.PI) * 0.15 : 1;
+    f.mesh.scale.setScalar(f.base * ease * over);
+    f.mesh.rotation.z += Math.sin(t * 1.5 + f.phase) * 0.0008;
+  }
+
+  // butterflies: wander + flap
+  for (const b of butterflies) {
+    if (t > b.nextPick) {
+      b.target.set(
+        THREE.MathUtils.clamp(b.pos.x + rnd(-2, 2), -HALF_H * camera.aspect * 0.9, HALF_H * camera.aspect * 0.9),
+        THREE.MathUtils.clamp(b.pos.y + rnd(-1.6, 1.6), -HALF_H * 0.9, HALF_H * 0.9),
+        THREE.MathUtils.clamp(b.pos.z + rnd(-1, 1), -3, 3)
+      );
+      b.nextPick = t + rnd(1.5, 3.5);
+    }
+    const prev = b.pos.clone();
+    b.pos.lerp(b.target, 1 - Math.pow(0.35, dt));
+    const wob = new THREE.Vector3(Math.sin(t * 3 + b.phase) * 0.012, Math.sin(t * 5 + b.phase) * 0.02, 0);
+    b.pos.add(wob);
+    b.vel.copy(b.pos).sub(prev).divideScalar(Math.max(dt, 1e-3));
+    b.g.position.copy(b.pos);
+    b.g.rotation.z = THREE.MathUtils.lerp(b.g.rotation.z, THREE.MathUtils.clamp(-b.vel.x * 0.25, -0.6, 0.6), 0.1);
+    const flap = 0.55 + 0.55 * Math.sin(t * b.flapSpeed + b.phase);
+    b.R.rotation.y = flap;
+    b.L.rotation.y = -flap;
+  }
+
+  cursor.rotation.z += 0.03;
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+
+async function init() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: "user" }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker = await HandLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numHands: 1
+    });
+    statusEl.textContent = "Ready — show your hand";
+  } catch (e) {
+    statusEl.textContent = "Error: " + e.message;
+    console.error(e);
+  }
+  animate();
+}
+init();
+</script>
+</body>
+</html>
